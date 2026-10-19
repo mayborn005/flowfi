@@ -29,7 +29,9 @@ vi.mock('../../../src/lib/prisma.js', () => {
     },
     streamEvent: {
       create: vi.fn(),
+      upsert: vi.fn(),
     },
+    $transaction: vi.fn(async (fn: any) => fn(mockPrisma)),
   };
   return {
     prisma: mockPrisma,
@@ -91,6 +93,23 @@ describe('POST /v1/streams/:streamId/cancel', () => {
       where: { streamId: BigInt(streamId) },
       data: { isActive: false },
     });
+    // Issue #1219: a provisional CANCELLED StreamEvent is written atomically
+    // so the stream immediately matches the "cancelled" status filter.
+    expect(prisma.streamEvent.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          transactionHash_eventType: {
+            transactionHash: 'tx_hash_123',
+            eventType: 'CANCELLED',
+          },
+        },
+        create: expect.objectContaining({
+          streamId: BigInt(streamId),
+          eventType: 'CANCELLED',
+          transactionHash: 'tx_hash_123',
+        }),
+      }),
+    );
   });
 
   it('returns 400 if senderSecret is not provided in the request body', async () => {
@@ -108,7 +127,7 @@ describe('POST /v1/streams/:streamId/cancel', () => {
       .set('Authorization', 'Bearer dummy_token');
 
     expect(res.status).toBe(400);
-    expect(res.body.message).toContain('senderSecret');
+    expect(res.body.error.message).toContain('senderSecret');
     expect(sorobanService.cancelStream).not.toHaveBeenCalled();
   });
 
@@ -127,7 +146,10 @@ describe('POST /v1/streams/:streamId/cancel', () => {
       .set('Authorization', 'Bearer dummy_token');
 
     expect(res.status).toBe(403);
-    expect(res.body.error).toBe('Forbidden');
+    expect(res.body.error).toMatchObject({
+      code: 'FORBIDDEN',
+      message: 'Only the sender can cancel the stream',
+    });
     expect(sorobanService.cancelStream).not.toHaveBeenCalled();
   });
 
@@ -158,7 +180,7 @@ describe('POST /v1/streams/:streamId/cancel', () => {
       .set('Authorization', 'Bearer dummy_token');
 
     expect(res.status).toBe(409);
-    expect(res.body.message).toContain('already cancelled');
+    expect(res.body.error.message).toContain('already cancelled');
   });
 
   it('handles concurrent cancel requests correctly', async () => {

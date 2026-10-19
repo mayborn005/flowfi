@@ -1,9 +1,9 @@
 import type { Request, Response } from "express";
 import { z } from "zod";
 import { Prisma } from "../generated/prisma/index.js";
-import { prisma } from "../lib/prisma.js";
+import { prisma, withReplicaFallback } from "../lib/prisma.js";
 import logger from "../logger.js";
-import { claimableAmountService } from "../services/claimable.service.js";
+import { claimableAmountService, calculateHistoricalStreamSnapshot, StreamSnapshotHistoryError } from "../services/claimable.service.js";
 import {
   getStreamFromChain,
   getClaimableFromChain,
@@ -14,12 +14,13 @@ import {
 } from "../services/sorobanService.js";
 import type { AuthenticatedRequest } from "../types/auth.types.js";
 import { parseStreamId } from "../lib/stream-id.js";
-import { createStreamSchema } from "../validators/stream.validator.js";
+import { createStreamSchema, parsePagination } from "../validators/stream.validator.js";
 import {
   DEFAULT_EVENTS_PAGE_SIZE,
   MAX_EVENTS_PAGE_SIZE,
 } from "../repositories/streamEvent.repository.js";
 import { findStreams } from "../repositories/stream.repository.js";
+import { sendApiError } from "../types/api-error.js";
 
 const DEFAULT_STREAM_PAGE_SIZE = 20;
 const MAX_STREAM_PAGE_SIZE = 100;
@@ -85,52 +86,48 @@ export const createStream = async (req: Request, res: Response) => {
   try {
     const callerPublicKey = (req as AuthenticatedRequest).user?.publicKey;
     if (!callerPublicKey) {
-      return res.status(401).json({ error: 'Unauthorized', message: 'Authentication required' });
+      return sendApiError(res, 401, 'UNAUTHORIZED', 'Authentication required');
     }
 
-    // Validate request body using the Zod schema, which includes the MAX_I128
-    // upper-bound check on ratePerSecond that the manual parsing omitted.
     const parsed = createStreamSchema.safeParse(req.body);
     if (!parsed.success) {
-      return res.status(400).json({
-        error: 'Validation error',
-        details: parsed.error.issues,
-      });
+      const message = parsed.error.issues
+        .map((issue) => `${issue.path.join('.') || 'request'}: ${issue.message}`)
+        .join('; ');
+      return sendApiError(res, 400, 'INVALID_REQUEST', message);
     }
 
-    const { streamId: parsedStreamId, sender, recipient, tokenAddress, ratePerSecond, depositedAmount, startTime: parsedStartTime } = parsed.data;
+    const {
+      streamId: parsedStreamId,
+      sender,
+      recipient,
+      tokenAddress,
+      ratePerSecond,
+      depositedAmount,
+      startTime: parsedStartTime,
+    } = parsed.data;
 
     // Issue #809: the authenticated wallet may only create/modify streams it owns.
     // Without this, any logged-in wallet could POST an arbitrary `sender` and have
     // it persisted, or flip another owner's cancelled stream back to active.
     if (sender !== callerPublicKey) {
-      return res.status(403).json({
-        error: 'Forbidden',
-        message: 'sender must match the authenticated wallet',
-      });
+      return sendApiError(res, 403, 'FORBIDDEN', 'sender must match the authenticated wallet');
     }
 
     const parsedRatePerSecond = BigInt(ratePerSecond);
     const parsedDepositedAmount = BigInt(depositedAmount);
 
     if (parsedRatePerSecond <= 0n) {
-      return res
-        .status(400)
-        .json({ error: "Invalid ratePerSecond: must be greater than zero" });
+      return sendApiError(res, 400, 'INVALID_RATE', 'Invalid ratePerSecond: must be greater than zero');
     }
 
     if (parsedDepositedAmount <= 0n) {
-      return res
-        .status(400)
-        .json({ error: "Invalid depositedAmount: must be greater than zero" });
+      return sendApiError(res, 400, 'INVALID_DEPOSITED_AMOUNT', 'Invalid depositedAmount: must be greater than zero');
     }
 
     const existing = await prisma.stream.findUnique({ where: { streamId: parsedStreamId } });
     if (existing && existing.sender !== callerPublicKey) {
-      return res.status(403).json({
-        error: 'Forbidden',
-        message: 'Cannot modify a stream owned by another wallet',
-      });
+      return sendApiError(res, 403, 'FORBIDDEN', 'Cannot modify a stream owned by another wallet');
     }
 
     const chainStream = await getStreamFromChain(parsedStreamId);
@@ -189,12 +186,10 @@ export const createStream = async (req: Request, res: Response) => {
       error instanceof TypeError
     ) {
       logger.error("Numeric parsing error in createStream:", error);
-      return res
-        .status(400)
-        .json({ error: "Invalid numeric values in request body" });
+      return sendApiError(res, 400, 'INVALID_NUMERIC_VALUES', 'Invalid numeric values in request body');
     }
     logger.error("Error creating/upserting stream:", error);
-    return res.status(500).json({ error: "Internal server error" });
+    return sendApiError(res, 500, 'INTERNAL_SERVER_ERROR', 'A technical error occurred. Please try again later.');
   }
 };
 
@@ -210,18 +205,13 @@ export const listStreams = async (req: Request, res: Response) => {
       token,
       sort = "createdAt",
       order = "desc",
-      limit = "20",
-      offset = "0",
     } = req.query;
 
     // Validate status parameter
     if (typeof status === "string") {
       const validStatuses = ["active", "cancelled", "completed", "paused"];
       if (!validStatuses.includes(status)) {
-        return res.status(400).json({
-          error: "Invalid status parameter",
-          message: `status must be one of: ${validStatuses.join(", ")}`,
-        });
+        return sendApiError(res, 400, "INVALID_STATUS", `status must be one of: ${validStatuses.join(", ")}`);
       }
     }
 
@@ -244,14 +234,16 @@ export const listStreams = async (req: Request, res: Response) => {
           | "endTime")
       : "createdAt";
 
-    // Validate and parse pagination parameters
-    const parsedLimit = Math.min(
-      typeof limit === "string"
-        ? Number.parseInt(limit, 10) || DEFAULT_STREAM_PAGE_SIZE
-        : DEFAULT_STREAM_PAGE_SIZE,
-      MAX_STREAM_PAGE_SIZE,
-    );
-    const parsedOffset = typeof offset === 'string' ? Math.max(0, Number.parseInt(offset, 10) || 0) : 0;
+    // Validate and parse pagination parameters (issue #1644): non-numeric,
+    // negative or zero values are a 400 rather than a silent default.
+    const pagination = parsePagination(req.query as Record<string, unknown>, {
+      defaultLimit: DEFAULT_STREAM_PAGE_SIZE,
+      maxLimit: MAX_STREAM_PAGE_SIZE,
+    });
+    if (!pagination.ok) {
+      return sendApiError(res, 400, "INVALID_PAGINATION", pagination.message);
+    }
+    const { limit: parsedLimit, offset: parsedOffset } = pagination;
 
     const params: import("../repositories/stream.repository.js").FindStreamsParams = {
       limit: parsedLimit,
@@ -277,7 +269,7 @@ export const listStreams = async (req: Request, res: Response) => {
     });
   } catch (error) {
     logger.error("Error listing streams:", error);
-    return res.status(500).json({ error: "Internal server error" });
+    return sendApiError(res, 500, "INTERNAL_SERVER_ERROR", "A technical error occurred. Please try again later.");
   }
 };
 
@@ -291,10 +283,10 @@ export const getStream = async (req: Request, res: Response) => {
       : req.params.streamId;
     const parsedStreamId = parseStreamId(streamIdParam);
     if (parsedStreamId === null) {
-      return res.status(400).json({ error: "Invalid streamId parameter" });
+      return sendApiError(res, 400, "INVALID_STREAM_ID", "Invalid streamId parameter");
     }
 
-    const stream = await prisma.stream.findUnique({
+    const stream = await withReplicaFallback((client) => client.stream.findUnique({
       where: { streamId: parsedStreamId },
       include: {
         senderUser: true,
@@ -303,13 +295,13 @@ export const getStream = async (req: Request, res: Response) => {
           orderBy: { timestamp: "desc" },
         },
       },
-    });
+    }));
 
     if (!stream) {
       // Fallback: try live RPC
       const chainStream = await getStreamFromChain(parsedStreamId);
       if (!chainStream) {
-        return res.status(404).json({ error: "Stream not found" });
+        return sendApiError(res, 404, "NOT_FOUND", "Stream not found");
       }
       return res.status(200).json({ ...chainStream, source: "chain" });
     }
@@ -327,7 +319,7 @@ export const getStream = async (req: Request, res: Response) => {
     return res.status(200).json(stream);
   } catch (error) {
     logger.error("Error fetching stream:", error);
-    return res.status(500).json({ error: "Internal server error" });
+    return sendApiError(res, 500, "INTERNAL_SERVER_ERROR", "A technical error occurred. Please try again later.");
   }
 };
 
@@ -341,12 +333,9 @@ export const getStreamEvents = async (req: Request, res: Response) => {
       : req.params.streamId;
     const parsedStreamId = parseStreamId(streamIdParam);
     if (parsedStreamId === null) {
-      return res.status(400).json({ error: "Invalid streamId parameter" });
+      return sendApiError(res, 400, "INVALID_STREAM_ID", "Invalid streamId parameter");
     }
 
-    const rawLimit = req.query["limit"];
-    const rawOffset = req.query["offset"];
-    const rawPage = req.query["page"];
     const cursor =
       typeof req.query["cursor"] === "string" ? req.query["cursor"] : undefined;
     const order =
@@ -356,20 +345,15 @@ export const getStreamEvents = async (req: Request, res: Response) => {
         ? req.query["eventType"]
         : undefined;
 
-    const limit = Math.min(
-      rawLimit && typeof rawLimit === "string"
-        ? Number.parseInt(rawLimit, 10) || DEFAULT_EVENTS_PAGE_SIZE
-        : DEFAULT_EVENTS_PAGE_SIZE,
-      MAX_EVENTS_PAGE_SIZE,
-    );
-
-    let offset = 0;
-    if (rawOffset && typeof rawOffset === 'string') {
-      offset = Math.max(0, Number.parseInt(rawOffset, 10) || 0);
-    } else if (rawPage && typeof rawPage === 'string' && !cursor) {
-      const page = Number.parseInt(rawPage, 10) || 1;
-      offset = Math.max(0, (page - 1) * limit);
+    const pagination = parsePagination(req.query as Record<string, unknown>, {
+      defaultLimit: DEFAULT_EVENTS_PAGE_SIZE,
+      maxLimit: MAX_EVENTS_PAGE_SIZE,
+    });
+    if (!pagination.ok) {
+      return sendApiError(res, 400, "INVALID_PAGINATION", pagination.message);
     }
+    const limit = pagination.limit;
+    const offset = pagination.offset;
 
     const whereClause: Prisma.StreamEventWhereInput = {
       streamId: parsedStreamId,
@@ -388,16 +372,13 @@ export const getStreamEvents = async (req: Request, res: Response) => {
         "ADMIN_TRANSFERRED",
       ];
       if (!validEventTypes.includes(eventType)) {
-        return res.status(400).json({
-          error: "Invalid eventType parameter",
-          message: `eventType must be one of: ${validEventTypes.join(", ")}`,
-        });
+        return sendApiError(res, 400, "INVALID_EVENT_TYPE", `eventType must be one of: ${validEventTypes.join(", ")}`);
       }
       whereClause.eventType = eventType;
     }
 
-    const [events, total] = await Promise.all([
-      prisma.streamEvent.findMany({
+    const [events, total] = await withReplicaFallback((client) => Promise.all([
+      client.streamEvent.findMany({
         where: whereClause,
         // `timestamp` is not unique (events in the same block/ledger can
         // share a timestamp), so it can't be the sole sort key for cursor
@@ -407,8 +388,8 @@ export const getStreamEvents = async (req: Request, res: Response) => {
         take: limit,
         ...(cursor ? { cursor: { id: cursor }, skip: 1 } : { skip: offset }),
       }),
-      prisma.streamEvent.count({ where: whereClause }),
-    ]);
+      client.streamEvent.count({ where: whereClause }),
+    ]));
 
     const hasMore = cursor
       ? events.length === limit
@@ -417,7 +398,7 @@ export const getStreamEvents = async (req: Request, res: Response) => {
     return res.status(200).json({ data: events, total, hasMore });
   } catch (error) {
     logger.error("Error fetching stream events:", error);
-    return res.status(500).json({ error: "Internal server error" });
+    return sendApiError(res, 500, "INTERNAL_SERVER_ERROR", "A technical error occurred. Please try again later.");
   }
 };
 
@@ -431,7 +412,7 @@ export const getStreamClaimableAmount = async (req: Request, res: Response) => {
       : req.params.streamId;
     const parsedStreamId = parseStreamId(streamIdParam);
     if (parsedStreamId === null) {
-      return res.status(400).json({ error: "Invalid streamId parameter" });
+      return sendApiError(res, 400, "INVALID_STREAM_ID", "Invalid streamId parameter");
     }
 
     const atQuery = req.query.at as string | undefined;
@@ -440,17 +421,15 @@ export const getStreamClaimableAmount = async (req: Request, res: Response) => {
     if (atQuery !== undefined) {
       requestedAt = Number.parseInt(atQuery, 10);
       if (!Number.isFinite(requestedAt) || requestedAt < 0) {
-        return res.status(400).json({
-          error: "Invalid query parameter",
-          message: "'at' must be a non-negative Unix timestamp in seconds",
-        });
+        return sendApiError(res, 400, "INVALID_QUERY_PARAMETER", "'at' must be a non-negative Unix timestamp in seconds");
       }
     }
 
-    const stream = await prisma.stream.findUnique({
+    const stream = await withReplicaFallback((client) => client.stream.findUnique({
       where: { streamId: parsedStreamId },
       select: {
         streamId: true,
+        tokenAddress: true,
         ratePerSecond: true,
         depositedAmount: true,
         withdrawnAmount: true,
@@ -462,7 +441,7 @@ export const getStreamClaimableAmount = async (req: Request, res: Response) => {
         totalPausedDuration: true,
         updatedAt: true,
       },
-    });
+    }));
 
     if (!stream) {
       // Fallback: try live RPC for claimable amount
@@ -477,7 +456,7 @@ export const getStreamClaimableAmount = async (req: Request, res: Response) => {
           source: "chain",
         });
       }
-      return res.status(404).json({ error: "Stream not found" });
+      return sendApiError(res, 404, "NOT_FOUND", "Stream not found");
     }
 
     // If DB data is stale, use live RPC
@@ -503,10 +482,51 @@ export const getStreamClaimableAmount = async (req: Request, res: Response) => {
     return res.status(200).json(result);
   } catch (error) {
     logger.error("Error calculating stream claimable amount:", error);
-    return res.status(500).json({ error: "Internal server error" });
+    return sendApiError(res, 500, "INTERNAL_SERVER_ERROR", "A technical error occurred. Please try again later.");
   }
 };
 
+/** Return reconstructed balances and lifecycle status at a Unix timestamp. */
+export const getStreamSnapshot = async (req: Request, res: Response) => {
+  try {
+    const streamIdParam = Array.isArray(req.params.streamId) ? req.params.streamId[0] : req.params.streamId;
+    const streamId = parseStreamId(streamIdParam);
+    if (streamId === null) return sendApiError(res, 400, 'INVALID_STREAM_ID', 'Invalid streamId parameter');
+
+    const rawTimestamp = req.query.timestamp;
+    if (typeof rawTimestamp !== 'string' || !/^\d+$/.test(rawTimestamp)) {
+      return sendApiError(res, 400, 'INVALID_TIMESTAMP', 'timestamp must be a non-negative Unix timestamp in seconds');
+    }
+    const timestamp = Number(rawTimestamp);
+    if (!Number.isSafeInteger(timestamp)) {
+      return sendApiError(res, 400, 'INVALID_TIMESTAMP', 'timestamp must be a safe Unix timestamp in seconds');
+    }
+
+    const target = BigInt(timestamp);
+    const stream = await prisma.stream.findUnique({
+      where: { streamId },
+      select: {
+        streamId: true,
+        ratePerSecond: true,
+        startTime: true,
+        events: {
+          where: { timestamp: { lte: target } },
+          orderBy: [{ timestamp: 'asc' }, { ledgerSequence: 'asc' }],
+          select: { eventType: true, amount: true, timestamp: true, metadata: true, ledgerSequence: true },
+        },
+      },
+    });
+    if (!stream) return sendApiError(res, 404, 'NOT_FOUND', 'Stream not found');
+
+    return res.status(200).json(calculateHistoricalStreamSnapshot(stream, stream.events, timestamp));
+  } catch (error) {
+    if (error instanceof StreamSnapshotHistoryError) {
+      return sendApiError(res, 409, 'HISTORY_UNAVAILABLE', error.message);
+    }
+    logger.error('Error reconstructing historical stream snapshot:', error);
+    return sendApiError(res, 500, 'INTERNAL_SERVER_ERROR', 'A technical error occurred. Please try again later.');
+  }
+};
 /**
  * Get user-level stream summary used by dashboard/profile cards.
  */
@@ -519,7 +539,7 @@ export const getUserStreamSummary = async (
       ? req.params.address[0]
       : (req.params.address ?? "").trim();
     if (!address) {
-      return res.status(400).json({ error: "Address is required" });
+      return sendApiError(res, 400, "INVALID_ADDRESS", "Address is required");
     }
 
     const nowMs = Date.now();
@@ -535,13 +555,14 @@ export const getUserStreamSummary = async (
     // unbounded DB queries.  Power users with more than MAX_USER_STREAMS
     // streams receive a truncated summary (the `truncated` flag lets the
     // frontend offer a pagination/export fallback).
-    const [outgoingStreams, incomingStreams] = await Promise.all([
-      prisma.stream.findMany({
+    const [outgoingStreams, incomingStreams] = await withReplicaFallback((client) => Promise.all([
+      client.stream.findMany({
         where: { sender: address },
         orderBy: { startTime: "desc" },
         take: MAX_USER_STREAMS,
         select: {
           streamId: true,
+          tokenAddress: true,
           ratePerSecond: true,
           depositedAmount: true,
           withdrawnAmount: true,
@@ -554,12 +575,13 @@ export const getUserStreamSummary = async (
           updatedAt: true,
         },
       }),
-      prisma.stream.findMany({
+      client.stream.findMany({
         where: { recipient: address },
         orderBy: { startTime: "desc" },
         take: MAX_USER_STREAMS,
         select: {
           streamId: true,
+          tokenAddress: true,
           ratePerSecond: true,
           depositedAmount: true,
           withdrawnAmount: true,
@@ -572,7 +594,7 @@ export const getUserStreamSummary = async (
           updatedAt: true,
         },
       }),
-    ]);
+    ]));
 
     const calculatedAt = Math.floor(nowMs / 1000);
 
@@ -623,7 +645,7 @@ export const getUserStreamSummary = async (
     return res.status(200).json(summary);
   } catch (error) {
     logger.error("Error fetching user stream summary:", error);
-    return res.status(500).json({ error: "Internal server error" });
+    return sendApiError(res, 500, "INTERNAL_SERVER_ERROR", "A technical error occurred. Please try again later.");
   }
 };
 
@@ -650,42 +672,38 @@ export const topUpStreamHandler = async (req: Request, res: Response) => {
       : req.params.streamId,
   );
   if (streamId === null) {
-    return res.status(400).json({ error: "Invalid streamId" });
+    return sendApiError(res, 400, "INVALID_STREAM_ID", "Invalid streamId");
   }
 
   const parsed = topUpBodySchema.safeParse(req.body);
   if (!parsed.success) {
-    return res
-      .status(400)
-      .json({ error: "Validation error", details: parsed.error.issues });
+    return sendApiError(res, 400, "VALIDATION_ERROR", "Request validation failed", parsed.error.issues);
   }
 
   const amount = BigInt(parsed.data.amount);
   if (amount <= 0n) {
-    return res.status(400).json({ error: "amount must be a positive integer" });
+    return sendApiError(res, 400, "INVALID_AMOUNT", "amount must be a positive integer");
   }
 
   const callerAddress = (req as AuthenticatedRequest).user?.publicKey;
   if (!callerAddress) {
-    return res.status(401).json({ error: "Unauthorized" });
+    return sendApiError(res, 401, "UNAUTHORIZED", "Authentication required");
   }
 
   try {
     const stream = await prisma.stream.findUnique({ where: { streamId } });
     if (!stream) {
-      return res.status(404).json({ error: "Stream not found" });
+      return sendApiError(res, 404, "NOT_FOUND", "Stream not found");
     }
     if (stream.sender !== callerAddress) {
-      return res
-        .status(403)
-        .json({ error: "Only the stream sender may top up this stream" });
+      return sendApiError(res, 403, "FORBIDDEN", "Only the stream sender may top up this stream");
     }
 
     if (!stream.isActive) {
-      return res.status(409).json({ error: 'Conflict', message: 'Cannot top up an inactive stream' });
+      return sendApiError(res, 409, "CONFLICT", "Cannot top up an inactive stream");
     }
     if (stream.isPaused) {
-      return res.status(409).json({ error: 'Conflict', message: 'Cannot top up a paused stream' });
+      return sendApiError(res, 409, "CONFLICT", "Cannot top up a paused stream");
     }
 
     const txHash = await topUpStream(streamId, amount, callerAddress);
@@ -710,7 +728,7 @@ export const topUpStreamHandler = async (req: Request, res: Response) => {
       .json({ streamId, txHash, depositedAmount: updatedStream!.depositedAmount });
   } catch (error: any) {
     logger.error(`[topUp] stream=${streamId} error:`, error);
-    return res.status(400).json({ error: 'Failed to top up stream on chain', message: error.message ?? 'Unknown error' });
+    return sendApiError(res, 400, "TOP_UP_FAILED", "Failed to top up stream on chain");
   }
 };
 
@@ -723,9 +741,7 @@ export const pauseStream = async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
 
     if (!authReq.user) {
-      return res
-        .status(401)
-        .json({ error: "Unauthorized", message: "Authentication required" });
+      return sendApiError(res, 401, "UNAUTHORIZED", "Authentication required");
     }
 
     const streamIdParam = Array.isArray(req.params.streamId)
@@ -733,7 +749,7 @@ export const pauseStream = async (req: Request, res: Response) => {
       : req.params.streamId;
     const parsedStreamId = parseStreamId(streamIdParam);
     if (parsedStreamId === null) {
-      return res.status(400).json({ error: "Invalid streamId parameter" });
+      return sendApiError(res, 400, "INVALID_STREAM_ID", "Invalid streamId parameter");
     }
 
     // Fetch the stream from database
@@ -742,31 +758,22 @@ export const pauseStream = async (req: Request, res: Response) => {
     });
 
     if (!stream) {
-      return res.status(404).json({ error: "Stream not found" });
+      return sendApiError(res, 404, "NOT_FOUND", "Stream not found");
     }
 
     // Verify the caller is the stream sender
     if (stream.sender !== authReq.user.publicKey) {
-      return res.status(403).json({
-        error: "Forbidden",
-        message: "Only the stream sender can pause the stream",
-      });
+      return sendApiError(res, 403, "FORBIDDEN", "Only the stream sender can pause the stream");
     }
 
     // Check if stream is already paused
     if (stream.isPaused) {
-      return res.status(409).json({
-        error: "Conflict",
-        message: "Stream is already paused",
-      });
+      return sendApiError(res, 409, "CONFLICT", "Stream is already paused");
     }
 
     // Check if stream is still active
     if (!stream.isActive) {
-      return res.status(409).json({
-        error: "Conflict",
-        message: "Cannot pause an inactive stream",
-      });
+      return sendApiError(res, 409, "CONFLICT", "Cannot pause an inactive stream");
     }
 
     try {
@@ -791,17 +798,11 @@ export const pauseStream = async (req: Request, res: Response) => {
         `Soroban pause failed for stream ${parsedStreamId}:`,
         sorobanError,
       );
-      return res.status(400).json({
-        error: "Failed to pause stream on chain",
-        message:
-          sorobanError instanceof Error
-            ? sorobanError.message
-            : "Unknown error",
-      });
+      return sendApiError(res, 400, "PAUSE_FAILED", "Failed to pause stream on chain");
     }
   } catch (error) {
     logger.error("Error pausing stream:", error);
-    return res.status(500).json({ error: "Internal server error" });
+    return sendApiError(res, 500, "INTERNAL_SERVER_ERROR", "A technical error occurred. Please try again later.");
   }
 };
 
@@ -814,9 +815,7 @@ export const resumeStream = async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
 
     if (!authReq.user) {
-      return res
-        .status(401)
-        .json({ error: "Unauthorized", message: "Authentication required" });
+      return sendApiError(res, 401, "UNAUTHORIZED", "Authentication required");
     }
 
     const streamIdParam = Array.isArray(req.params.streamId)
@@ -824,7 +823,7 @@ export const resumeStream = async (req: Request, res: Response) => {
       : req.params.streamId;
     const parsedStreamId = parseStreamId(streamIdParam);
     if (parsedStreamId === null) {
-      return res.status(400).json({ error: "Invalid streamId parameter" });
+      return sendApiError(res, 400, "INVALID_STREAM_ID", "Invalid streamId parameter");
     }
 
     // Fetch the stream from database
@@ -833,23 +832,17 @@ export const resumeStream = async (req: Request, res: Response) => {
     });
 
     if (!stream) {
-      return res.status(404).json({ error: "Stream not found" });
+      return sendApiError(res, 404, "NOT_FOUND", "Stream not found");
     }
 
     // Verify the caller is the stream sender
     if (stream.sender !== authReq.user.publicKey) {
-      return res.status(403).json({
-        error: "Forbidden",
-        message: "Only the stream sender can resume the stream",
-      });
+      return sendApiError(res, 403, "FORBIDDEN", "Only the stream sender can resume the stream");
     }
 
     // Check if stream is paused
     if (!stream.isPaused) {
-      return res.status(409).json({
-        error: "Conflict",
-        message: "Stream is not paused",
-      });
+      return sendApiError(res, 409, "CONFLICT", "Stream is not paused");
     }
 
     try {
@@ -874,16 +867,10 @@ export const resumeStream = async (req: Request, res: Response) => {
         `Soroban resume failed for stream ${parsedStreamId}:`,
         sorobanError,
       );
-      return res.status(400).json({
-        error: "Failed to resume stream on chain",
-        message:
-          sorobanError instanceof Error
-            ? sorobanError.message
-            : "Unknown error",
-      });
+      return sendApiError(res, 400, "RESUME_FAILED", "Failed to resume stream on chain");
     }
   } catch (error) {
     logger.error("Error resuming stream:", error);
-    return res.status(500).json({ error: "Internal server error" });
+    return sendApiError(res, 500, "INTERNAL_SERVER_ERROR", "A technical error occurred. Please try again later.");
   }
 };
